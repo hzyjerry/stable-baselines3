@@ -45,6 +45,8 @@ def _worker(
                 break
             elif cmd == "get_spaces":
                 remote.send((env.observation_space, env.action_space))
+            elif cmd == "get_coeff_dim":
+                remote.send((env.coeff_dim))
             elif cmd == "env_method":
                 method = getattr(env, data[0])
                 remote.send(method(*data[1], **data[2]))
@@ -85,31 +87,47 @@ class SubprocVecEnv(VecEnv):
     """
 
     def __init__(self, env_fns: List[Callable[[], gym.Env]], start_method: Optional[str] = None):
-        self.waiting = False
-        self.closed = False
-        n_envs = len(env_fns)
-
         if start_method is None:
             # Fork is not a thread safe method (see issue #217)
             # but is more user friendly (does not require to wrap the code in
             # a `if __name__ == "__main__":`)
             forkserver_available = "forkserver" in mp.get_all_start_methods()
             start_method = "forkserver" if forkserver_available else "spawn"
-        ctx = mp.get_context(start_method)
+        self.ctx = mp.get_context(start_method)
+        self.env_fns = env_fns
+        self.setup()
+        self.remotes[0].send(("get_spaces", None))
+        observation_space, action_space = self.remotes[0].recv()
+        self.remotes[0].send(("get_coeff_dim", None))
+        coeff_dim = self.remotes[0].recv()
+        self.coeff_dim = coeff_dim
+        VecEnv.__init__(self, len(env_fns), observation_space, action_space)
 
-        self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(n_envs)])
+
+    def setup(self):
+        self.waiting = False
+        self.closed = False
+        n_envs = len(self.env_fns)
+
+        self.remotes, self.work_remotes = zip(*[self.ctx.Pipe() for _ in range(n_envs)])
         self.processes = []
-        for work_remote, remote, env_fn in zip(self.work_remotes, self.remotes, env_fns):
+        for work_remote, remote, env_fn in zip(self.work_remotes, self.remotes, self.env_fns):
             args = (work_remote, remote, CloudpickleWrapper(env_fn))
             # daemon=True: if the main process crashes, we should not cause things to hang
-            process = ctx.Process(target=_worker, args=args, daemon=True)  # pytype:disable=attribute-error
+            process = self.ctx.Process(target=_worker, args=args, daemon=True)  # pytype:disable=attribute-error
             process.start()
             self.processes.append(process)
             work_remote.close()
+        # for p in self.processes:
+        #     p.join()
 
-        self.remotes[0].send(("get_spaces", None))
-        observation_space, action_space = self.remotes[0].recv()
-        VecEnv.__init__(self, len(env_fns), observation_space, action_space)
+    def clean(self):
+        """ Kill and recreate process """
+        for p in self.processes:
+            p.terminate()
+            p.join()
+        self.setup()
+
 
     def step_async(self, actions: np.ndarray) -> None:
         for remote, action in zip(self.remotes, actions):
